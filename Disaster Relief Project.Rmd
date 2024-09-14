@@ -1,0 +1,1277 @@
+---
+title: "Disaster Relief Project"
+author: ""
+date: "2024-07-21"
+output: pdf_document
+---
+
+```{r hide-code, setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+knitr::opts_chunk$set(fig.align="center", fig.pos="tbh")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+knitr::opts_chunk$set(echo=FALSE)
+```
+
+```{r}
+library(doParallel)
+cl <- makePSOCKcluster(parallel::detectCores(logical = FALSE))
+registerDoParallel(cl)
+```
+
+```{r loading_required_packages}
+library(tidyverse)
+library(tidymodels)
+library(kableExtra)
+library(pROC)
+library(ggplot2)
+library(glmnet)
+library(dplyr)
+library(GGally)
+library(cowplot)
+library(ROCR)
+library(ggcorrplot)
+library(probably)
+library(discrim)
+library(patchwork)
+library(grid)
+library(gridExtra)
+```
+
+
+```{r}
+# Below are the functions used throughout this project
+
+# the roc_cv_data function is used to collect metrics from the three models for
+# a roc curve
+
+roc_cv_data <- function(model_cv) {
+  cv_predictions <- collect_predictions(model_cv)
+  cv_predictions %>%
+  roc_curve(truth=Blue_Tarp, .pred_Yes, event_level="second")
+}
+
+# this function is used to collect and plot threshold for each model
+
+threshold_graph <- function(model_cv, model_name) {
+  performance <- probably::threshold_perf(collect_predictions(model_cv), Blue_Tarp, .pred_Yes,
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, accuracy, kap))
+  max_metrics <- performance %>%
+    group_by(.metric) %>%
+    filter(.estimate == max(.estimate))
+  ggplot(performance, aes(x=.threshold, y=.estimate, color=.metric)) +
+    geom_line() +
+    geom_point(data=max_metrics, color="black") +
+    labs(title=model_name, x="Threshold", y="Metric value") +
+    coord_cartesian(ylim=c(0, 0.99))
+}
+
+# this function displays a confusion matrix for each model for different thresholds
+
+visualize_conf_mat <- function(model_cv,threshold) {
+  cm <- collect_predictions(model_cv) %>%
+    mutate(
+      .pred_class = if_else(.pred_Yes>threshold, 'Yes', 'No'),
+      .pred_class = factor(.pred_class, levels=c('No', 'Yes'))
+    ) %>%
+    conf_mat(truth=Blue_Tarp, estimate=.pred_class)
+  autoplot(cm, type='heatmap') +
+    labs(title=sprintf('Threshold %.2f', threshold))
+}
+
+# combines the previous threshold graphs and confusion matrices into one graph
+
+overview_model <- function(model_cv, model_name, thresholds) {
+  g <- threshold_graph(model_cv, model_name)
+  g1 <- visualize_conf_mat(model_cv, thresholds[1])
+  g2 <- visualize_conf_mat(model_cv, thresholds[2])
+  g3 <- visualize_conf_mat(model_cv, thresholds[3])
+  g + (g1 / g2 / g3)
+}
+```
+
+```{r}
+data_train <- read_csv("HaitiPixels.csv")
+data_train <- data_train %>%
+  mutate(
+    Class = as.factor(data_train$Class),
+    Blue_Tarp = if_else(Class == "Blue Tarp", "Yes", "No"),
+    Blue_Tarp = factor(Blue_Tarp, levels = c("No", "Yes"))
+)
+data_train %>% glimpse()
+```
+
+```{r}
+# wrangle holdout data
+
+# Define new column names
+new_col_names <- c("ID", "X", "Y", "Map_X", "Map_Y", "Lat", "Lon", "B1", "B2", "B3")
+
+blue_tarp1 <- read.table("orthovnir067_ROI_Blue_Tarps.txt", header = FALSE, skip = 8, sep = "", quote = "\"", col.names = new_col_names)
+blue_tarp2 <- read.table("orthovnir069_ROI_Blue_Tarps.txt", header = FALSE, skip = 8, sep = "", quote = "\"", col.names = new_col_names)
+blue_tarp3 <- read.table("orthovnir078_ROI_Blue_Tarps.txt", header = FALSE, skip = 8, sep = "", quote = "\"", col.names = new_col_names)
+not_blue_tarp1 <- read.table("orthovnir057_ROI_NON_Blue_Tarps.txt", header = FALSE, skip = 8, sep = "", quote = "\"", col.names = new_col_names)
+not_blue_tarp2 <- read.table("orthovnir067_ROI_NOT_Blue_Tarps.txt", header = FALSE, skip = 8, sep = "", quote = "\"", col.names = new_col_names)
+not_blue_tarp3 <- read.table("orthovnir069_ROI_NOT_Blue_Tarps.txt", header = FALSE, skip = 8, sep = "", quote = "\"", col.names = new_col_names)
+not_blue_tarp4 <- read.table("orthovnir078_ROI_NON_Blue_Tarps.txt", header = FALSE, skip = 8, sep = "", quote = "\"", col.names = new_col_names)
+```
+
+```{r}
+# add the Blue_Tarp Variable
+blue_tarp1$Blue_Tarp <- "Yes"
+blue_tarp2$Blue_Tarp <- "Yes"
+blue_tarp3$Blue_Tarp <- "Yes"
+not_blue_tarp1$Blue_Tarp <- "No"
+not_blue_tarp2$Blue_Tarp <- "No"
+not_blue_tarp3$Blue_Tarp <- "No"
+not_blue_tarp4$Blue_Tarp <- "No"
+
+# Combine all data frames into one
+data_holdout <- bind_rows(blue_tarp1, blue_tarp2, blue_tarp3, not_blue_tarp1, not_blue_tarp2, not_blue_tarp3, not_blue_tarp4)
+
+# Convert Blue_Tarp variable to a factor
+data_holdout <- data_holdout %>%
+  mutate(
+    Blue_Tarp = as.factor(data_holdout$Blue_Tarp))
+```
+
+```{r}
+mean_rgb <- data_train %>%
+  group_by(Blue_Tarp) %>%
+  summarise(
+    Mean_Red = mean(Red, na.rm = TRUE),
+    Mean_Green = mean(Green, na.rm = TRUE),
+    Mean_Blue = mean(Blue, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = starts_with("Mean"), names_to = "Variable", values_to = "Mean_Value")
+
+# Calculate mean B1, B2, B3 values for the holdout set grouped by Blue_Tarp
+mean_b123 <- data_holdout %>%
+  group_by(Blue_Tarp) %>%
+  summarise(
+    Mean_B1 = mean(B1, na.rm = TRUE),  # Assuming Red, Green, Blue have been renamed to B1, B2, B3
+    Mean_B2 = mean(B2, na.rm = TRUE),
+    Mean_B3 = mean(B3, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = starts_with("Mean"), names_to = "Variable", values_to = "Mean_Value")
+```
+
+```{r}
+# Plots for the Mean Color Values
+
+# Assign custom colors
+color_map <- c("Mean_Red" = "red", "Mean_Green" = "green", "Mean_Blue" = "blue",
+               "Mean_B1" = "red", "Mean_B2" = "green", "Mean_B3" = "blue")
+
+# Plot for Training Set
+p1 <- ggplot(mean_rgb, aes(x = Blue_Tarp, y = Mean_Value, fill = Variable)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Mean RGB Values in Training Set",
+       x = "Blue Tarp Presence",
+       y = "Mean Value",
+       fill = "Variable") +
+  theme_minimal() +
+  scale_fill_manual(values = color_map)
+
+# Plot for Holdout Set
+p2 <- ggplot(mean_b123, aes(x = Blue_Tarp, y = Mean_Value, fill = Variable)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Mean B1, B2, B3 Values in Holdout Set",
+       x = "Blue Tarp Presence",
+       y = "Mean Value",
+       fill = "Variable") +
+  theme_minimal() +
+  scale_fill_manual(values = color_map)
+
+# Print plots
+p1 + p2
+```
+
+```{r}
+library(corrplot)
+# Select the color columns
+color_cols <- c("Red", "Green", "Blue")
+
+# Compute the correlation matrix
+cor_mat <- cor(data_train[, color_cols])
+
+# Create the heatmap
+corrplot(cor_mat, 
+         method = "circle", 
+         type = "upper", 
+         tl.cex = 0.8, 
+         addCoef.col = "black", 
+         col = colorRampPalette(c("#6D9EC1", "#FFFFFF", "#E46726"))(200), 
+         title = "Correlation of Color Values",
+         mar = c(0, 0, 1, 0))
+
+
+```
+
+```{r}
+GGally::ggpairs(data_train,columns = 2:4,
+                ggplot2::aes(colour=Class))
+
+```
+
+```{r}
+# Function to create density plots for different classes
+create_density_plot <- function(data_train, Class, main_color, title) {
+  data_train %>%
+    dplyr::filter(Class == Class) %>%
+    ggplot(aes(x = Green), color = 'green') +
+    geom_density(color = main_color) +
+    geom_density(aes(x = Red), color = 'red') +
+    geom_density(aes(x = Blue), color = 'blue') + 
+    geom_density(aes(x = Green), color = 'green')+
+    labs(x = "Pixel Value", y = "Density", title = title) +
+    scale_x_continuous(limits = c(0, 255))
+}
+
+# Generate plots
+vegetation <- create_density_plot(data_train, "Vegetation", 'green', "Vegetation")
+soil <- create_density_plot(data_train, "Soil", 'brown', "Soil")
+rooftop <- create_density_plot(data_train, "Rooftop", 'gray', "Rooftop")
+bluetarp <- create_density_plot(data_train, "Blue Tarp", 'blue', "Blue Tarp")
+non_tarp <- create_density_plot(data_train, "Various Non-Tarp", 'orange', "Various Non-Tarp")
+
+# Arrange plots in a grid
+plot_grid(vegetation, soil, rooftop, bluetarp, non_tarp, ncol = 3)
+```
+
+```{r}
+# Box plot for Red, Green, and Blue variables grouped by Blue_Tarp
+plot_red <- ggplot(data_train, aes(x = Blue_Tarp, y = Red, fill = Blue_Tarp)) +
+  geom_boxplot() +
+  labs(x = "Blue_Tarp", y = "Red Value", fill = "Blue_Tarp") +
+  ggtitle("Box Plot of Red Value by Blue_Tarp") +
+  theme_minimal()
+
+plot_green <- ggplot(data_train, aes(x = Blue_Tarp, y = Green, fill = Blue_Tarp)) +
+  geom_boxplot() +
+  labs(x = "Blue_Tarp", y = "Green Value", fill = "Blue_Tarp") +
+  ggtitle("Box Plot of Green Value by Blue_Tarp") +
+  theme_minimal()
+
+plot_blue <- ggplot(data_train, aes(x = Blue_Tarp, y = Blue, fill = Blue_Tarp)) +
+  geom_boxplot() +
+  labs(x = "Blue_Tarp", y = "Blue Value", fill = "Blue_Tarp") +
+  ggtitle("Box Plot of Blue Value by Blue_Tarp") +
+  theme_minimal()
+
+grid.arrange(plot_red, plot_green, plot_blue, ncol = 2)
+
+```
+
+```{r}
+# Change column names in the holdout set
+data_holdout <- data_holdout %>%
+  rename(Red = B1, Green = B2, Blue = B3)
+```
+
+```{r results='hide'}
+# View a summary of the datasets
+summary(data_holdout)
+summary(data_train)
+```
+
+```{r}
+# Calculate the percentage of "Yes" for Blue_Tarp in the training dataset
+percentage_yes_train <- data_train %>%
+  summarise(Percentage_Yes = mean(Blue_Tarp == "Yes") * 100) %>%
+  pull(Percentage_Yes)
+
+# Calculate the percentage of "Yes" for Blue_Tarp in the holdout dataset
+percentage_yes_holdout <- data_holdout %>%
+  summarise(Percentage_Yes = mean(Blue_Tarp == "Yes") * 100) %>%
+  pull(Percentage_Yes)
+
+percentage_yes_train
+percentage_yes_holdout
+```
+
+```{r}
+#use random seed for reproducibility
+set.seed(42)
+formula <- Blue_Tarp ~ Red + Blue + Green
+tarp_recipe <- recipe(formula, data = data_train)
+```
+
+```{r}
+# set engine per model
+logreg_spec <- logistic_reg(mode="classification", penalty = 0.01) %>%
+  set_engine('glm')
+
+lda_spec <- discrim_linear(mode="classification") %>%
+  set_engine('MASS')
+
+qda_spec <- discrim_quad(mode="classification") %>%
+  set_engine('MASS')
+
+knn_spec <- nearest_neighbor(
+  mode = "classification",
+  neighbors = tune()
+) %>% 
+  set_engine("kknn")
+
+log_reg_spec_pen <- logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("classification")
+
+svm_linear_spec <- svm_linear(cost = tune(), margin = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+
+rf_spec <- rand_forest(
+  mode = "classification",
+  trees = 1000,         # Number of trees can be specified as needed
+  min_n = tune(),
+  mtry = tune()
+) %>%
+  set_engine("ranger")
+
+svm_poly_spec <- svm_poly(cost = tune(), margin = tune(), degree = tune()) %>%
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+
+#svm_rbf_spec <- svm_rbf(cost = tune(), margin = tune(), rbf_sigma = tune()) %>% 
+#  set_engine("kernlab") %>% 
+#  set_mode("classification")
+```
+
+```{r}
+#initiate workflow
+logreg_wf <- workflow() %>%
+  add_recipe(tarp_recipe) %>%
+  add_model(logreg_spec)
+
+lda_wf <- workflow() %>%
+  add_recipe(tarp_recipe) %>%
+  add_model(lda_spec)
+
+qda_wf <- workflow() %>%
+  add_recipe(tarp_recipe) %>%
+  add_model(qda_spec)
+
+knn_wf <- workflow() %>%
+  add_recipe(tarp_recipe) %>%
+  add_model(knn_spec)
+
+log_reg_pen_wf <- workflow() %>% 
+  add_recipe(tarp_recipe) %>% 
+  add_model(log_reg_spec_pen)
+
+svm_linear_wf <- workflow() %>% 
+  add_recipe(tarp_recipe) %>% 
+  add_model(svm_linear_spec)
+
+rf_wf <- workflow() %>%
+  add_recipe(tarp_recipe) %>%
+  add_model(rf_spec)
+
+svm_poly_wf <- workflow() %>%
+  add_recipe(tarp_recipe) %>% 
+  add_model(svm_poly_spec)
+
+#svm_rbf_wf <- workflow() %>% 
+#  add_recipe(tarp_recipe) %>% 
+#  add_model(svm_rbf_spec)
+```
+
+```{r}
+#grid for tuning
+knn_grid <- grid_regular(neighbors(range = c(1, 20)), levels = 20)
+```
+
+```{r}
+# Defining the resampling method
+cv_splits <- vfold_cv(data_train, v = 10)
+```
+
+```{r}
+# Perform the tuning
+knn_tune <- tune_grid(
+  knn_wf,
+  resamples = cv_splits,
+  grid = knn_grid,
+  metrics = metric_set(accuracy)
+)
+```
+
+```{r}
+log_reg_pen_tune <- tune_bayes( 
+  log_reg_pen_wf,
+  resamples = cv_splits, 
+  initial = 5, iter = 10, 
+  control = control_bayes(no_improve = 5, verbose = TRUE))
+```
+
+```{r}
+svm_linear_tune <- tune_bayes( 
+  svm_linear_wf,
+  resamples = cv_splits, 
+  initial = 5, 
+  iter = 10, 
+  control = control_bayes(no_improve = 5, verbose = TRUE))
+```
+
+```{r}
+rf_parameters <- extract_parameter_set_dials(rf_wf)
+rf_parameters <- extract_parameter_set_dials(rf_wf) %>%
+  update(mtry = mtry(c(1,3)))
+
+rf_tune <- tune_bayes(
+  rf_wf,
+  resamples = cv_splits,
+  initial = 5, 
+  iter = 10,
+  param_info = rf_parameters,
+  control = control_bayes(no_improve = 5, verbose = TRUE))
+```
+
+```{r}
+svm_poly_tune <- tune_bayes( 
+  svm_poly_wf, 
+  resamples = cv_splits, 
+  initial = 5, 
+  iter = 10, 
+  control = control_bayes(no_improve = 5, verbose = TRUE))
+```
+
+```{r}
+# Define rbf_sigma range with log10 transformation 
+rbf_sigma_range <- parameters(svm_rbf_spec) %>% 
+  update(rbf_sigma = rbf_sigma(range = c(-4, 0), trans = log10_trans()))
+
+svm_rbf_tune <- tune_bayes( 
+  svm_rbf_wf, 
+  resamples = cv_splits, 
+  param_info = rbf_sigma_range, 
+  initial = 10, 
+  iter = 5, 
+  control = control_bayes(no_improve = 10, verbose = TRUE))
+```
+
+```{r}
+# Collect results
+knn_results <- knn_tune %>%
+  collect_metrics()
+
+# Select the best k based on accuracy
+best_k <- knn_results %>%
+  filter(.metric == "accuracy") %>%
+  slice_max(mean, n = 1) %>%
+  pull(neighbors)
+
+log_reg_pen_results <- log_reg_pen_tune %>%
+  collect_metrics()
+
+best_log_reg_pen <- log_reg_pen_results %>%
+  filter(.metric == "accuracy") %>%
+  arrange(desc(mean)) %>%
+  slice(1) %>%
+  mutate(model = "Penalized Logistic Regression") 
+
+svm_linear_results <- svm_linear_tune %>%
+  collect_metrics()
+
+best_svm_linear <- svm_linear_results %>%
+  filter(.metric == "accuracy") %>%
+  arrange(desc(mean)) %>%
+  slice(1) %>% 
+  mutate(model = "SVM Linear")
+
+rf_results <- rf_tune %>%
+  collect_metrics()
+
+best_rf <- rf_results %>%
+  filter(.metric == "accuracy") %>%
+  arrange(desc(mean)) %>%
+  slice(1) %>% 
+  mutate(model = "Random Forest")
+```
+
+```{r}
+# Collect results for SVM with a polynomial kernel
+svm_poly_results <- svm_poly_tune %>%
+  collect_metrics()
+
+# Select the best configuration based on accuracy for SVM with a polynomial kernel
+best_svm_poly <- svm_poly_results %>%
+  filter(.metric == "accuracy") %>%
+  arrange(desc(mean)) %>%
+  slice(1) %>% 
+  mutate(model = "SVM Polynomial")
+
+# Collect results for SVM with an RBF kernel
+#svm_rbf_results <- svm_rbf_tune %>%
+#  collect_metrics()
+
+# Select the best configuration based on accuracy for SVM with an RBF kernel
+#best_svm_rbf <- svm_rbf_results %>%
+#  filter(.metric == "accuracy") %>%
+#  arrange(desc(mean)) %>%
+#  slice(1) %>% 
+#  mutate(model = "SVM RBF")
+```
+
+```{r}
+# Extract the best hyperparameters
+
+best_knn <- knn_tune %>%
+  select_best(metric = "accuracy")
+
+log_reg_pen_best <- log_reg_pen_tune %>%
+  select_best(metric = "accuracy")
+
+svm_linear_best <- svm_linear_tune %>%
+  select_best(metric = "accuracy")
+
+rf_best <- rf_tune %>%
+  select_best(metric = "accuracy")
+```
+
+```{r}
+svm_poly_best <- svm_poly_tune %>%
+  select_best(metric = "accuracy")
+
+svm_rbf_best <- svm_rbf_tune %>%
+  select_best(metric = "accuracy")
+```
+
+```{r}
+# Create a table to display all optimal model tuning parameters
+best_params_table <- tibble(
+  Model = c("KNN", "Penalized Logistic Regression", "SVM Linear", "Random Forest", "SVM Polynomial", "SVM RBF"),
+  neighbors = c(best_knn$neighbors, NA, NA, NA, NA, NA),
+  config = c(best_knn$.config, log_reg_pen_best$.config, svm_linear_best$.config, rf_best$.config, svm_poly_best$.config, svm_rbf_best$.config),
+  penalty = c(NA, log_reg_pen_best$penalty, NA, NA, NA, NA),
+  cost = c(NA, NA, svm_linear_best$cost, NA, svm_poly_best$cost, svm_rbf_best$cost),
+  margin = c(NA, NA, svm_linear_best$margin, NA, svm_poly_best$margin, svm_rbf_best$margin),
+  mtry = c(NA, NA, NA, rf_best$mtry, NA, NA),
+  min_n = c(NA, NA, NA, rf_best$min_n, NA, NA),
+  degree = c(NA, NA, NA, NA, svm_poly_best$degree, NA)
+)
+
+# Display the table
+print(best_params_table)
+```
+
+```{r}
+# Finalize the workflow with the best hyperparameters
+
+final_knn_wf <- knn_wf %>%
+  finalize_workflow(best_knn)
+
+final_log_reg_pen_wf <- log_reg_pen_wf %>%
+  finalize_workflow(log_reg_pen_best)
+
+final_svm_linear_wf <- svm_linear_wf %>%
+  finalize_workflow(svm_linear_best)
+
+final_rf_wf <- rf_wf %>%
+  finalize_workflow(rf_best)
+```
+
+```{r}
+final_svm_poly_wf <- svm_poly_wf %>%
+  finalize_workflow(svm_poly_best)
+
+final_svm_rbf_wf <- svm_rbf_wf %>%
+  finalize_workflow(svm_rbf_best)
+```
+
+```{r}
+# Cross validation for model selection 
+resamples <- vfold_cv(data_train, v=10, strata=Blue_Tarp)
+tarp_metrics <- metric_set(roc_auc, accuracy, sensitivity, specificity, precision)
+cv_control <- control_resamples(save_pred=TRUE)
+```
+
+```{r}
+# fit model resamples for cross validation
+logreg_cv <- fit_resamples(logreg_wf, resamples, metrics=tarp_metrics, control=cv_control)
+lda_cv <- fit_resamples(lda_wf, resamples, metrics=tarp_metrics, control=cv_control)
+qda_cv <- fit_resamples(qda_wf, resamples, metrics=tarp_metrics, control=cv_control)
+knn_cv <- fit_resamples(final_knn_wf, resamples, metrics=tarp_metrics, control=cv_control)
+logreg_pen_cv <- fit_resamples(final_log_reg_pen_wf, resamples, metrics=tarp_metrics, control=cv_control)
+svm_linear_cv <- fit_resamples(final_svm_linear_wf, resamples, metrics=tarp_metrics, control=cv_control)
+rf_cv <- fit_resamples(final_rf_wf, resamples, metrics=tarp_metrics, control=cv_control)
+```
+
+```{r}
+svm_poly_cv <- fit_resamples(final_svm_poly_wf, resamples, metrics=tarp_metrics, control=cv_control)
+#svm_rbf_cv <- fit_resamples(final_svm_rbf_wf, resamples, metrics=tarp_metrics, control=cv_control)
+```
+
+```{r}
+# collect the cv metrics and create a table that displays these metrics
+cv_metrics <- bind_rows(
+  collect_metrics(logreg_cv) %>% mutate(model="Logistic regression"),
+  collect_metrics(lda_cv) %>% mutate(model="LDA"),
+  collect_metrics(qda_cv) %>% mutate(model="QDA"),
+  collect_metrics(knn_cv) %>% mutate(model="KNN"),
+  collect_metrics(svm_linear_cv) %>% mutate(model="Linear SVM"), 
+  collect_metrics(rf_cv) %>% mutate(model="Random Forest"), 
+  collect_metrics(svm_poly_cv) %>% mutate(model="Polynomial SVM"),
+  #collect_metrics(svm_rbf_cv) %>% mutate(model="RBF SVM") 
+)
+cv_metrics %>%
+  dplyr::select(model, .metric, mean) %>%
+  pivot_wider(names_from=".metric", values_from="mean") %>%
+  knitr::kable(caption="Cross-validation performance metrics", digits=3)
+```
+
+```{r}
+# Use the roc_cv_data function to collect metrics and plot all roc curves
+
+bind_rows(
+  roc_cv_data(logreg_cv) %>% mutate(model="Logistic regression"),
+  roc_cv_data(lda_cv) %>% mutate(model="LDA"),
+  roc_cv_data(qda_cv) %>% mutate(model="QDA"),
+  roc_cv_data(knn_cv) %>% mutate(model="KNN"),
+  roc_cv_data(logreg_pen_cv) %>% mutate(model="Penalized Logistic Regression"),
+  roc_cv_data(svm_linear_cv) %>% mutate(model="Linear SVM"),
+  roc_cv_data(rf_cv) %>% mutate(model="Random Forest"),      
+  roc_cv_data(svm_poly_cv) %>% mutate(model="Polynomial SVM"),
+  #roc_cv_data(svm_rbf_cv) %>% mutate(model="RBF SVM")          
+) %>%
+  
+ggplot(aes(x=1-specificity, y=sensitivity, color=model)) +
+  geom_line()
+
+```
+
+```{r}
+# this chunk is used to fit the models to the training data and look at the cv results
+
+# Fit resamples for cross-validation including SVM with Polynomial and RBF kernels
+logreg_result_cv <- fit_resamples(logreg_wf, resamples, metrics=tarp_metrics, control=cv_control)
+lda_result_cv <- fit_resamples(lda_wf, resamples, metrics=tarp_metrics, control=cv_control)
+qda_result_cv <- fit_resamples(qda_wf, resamples, metrics=tarp_metrics, control=cv_control)
+knn_result_cv <- fit_resamples(final_knn_wf, resamples, metrics=tarp_metrics, control=cv_control)
+logreg_pen_result_cv <- fit_resamples(final_log_reg_pen_wf, resamples, metrics=tarp_metrics, control=cv_control)
+svm_linear_result_cv <- fit_resamples(final_svm_linear_wf, resamples, metrics=tarp_metrics, control=cv_control)
+svm_poly_result_cv <- fit_resamples(final_svm_poly_wf, resamples, metrics=tarp_metrics, control=cv_control)  
+#svm_rbf_result_cv <- fit_resamples(final_svm_rbf_wf, resamples, metrics=tarp_metrics, control=cv_control)  
+rf_result_cv <- fit_resamples(final_rf_wf, resamples, metrics=tarp_metrics, control=cv_control)
+
+# Fit final models on the full training data including SVM with Polynomial and RBF kernels
+logreg_fitted_model <- logreg_wf %>% fit(data_train)
+lda_fitted_model <- lda_wf %>% fit(data_train)
+qda_fitted_model <- qda_wf %>% fit(data_train)
+knn_fitted_model <- final_knn_wf %>% fit(data_train)
+logreg_pen_fitted_model <- final_log_reg_pen_wf %>% fit(data_train)
+svm_linear_fitted_model <- final_svm_linear_wf %>% fit(data_train)
+svm_poly_fitted_model <- final_svm_poly_wf %>% fit(data_train)  
+#svm_rbf_fitted_model <- final_svm_rbf_wf %>% fit(data_train)   
+rf_fitted_model <- final_rf_wf %>% fit(data_train)
+
+
+```
+
+
+```{r}
+# uses the overview function to display logistic regession model thresholds and 
+# confusion matrices
+
+overview_model(logreg_cv, "Logistic regression", c(0.075, 0.20, 0.23))
+```
+
+```{r}
+# uses the overview function to display LDA model thresholds and confusion matrices
+
+overview_model(lda_cv, "LDA", c(0.075, 0.80, 0.85))
+```
+
+```{r}
+# uses the overview function to display QDA model thresholds and confusion matrices
+
+overview_model(qda_cv, "QDA", c(0.07, 0.24, 0.3))
+```
+
+```{r}
+knn_predictions <- knn_cv %>% collect_predictions()
+glimpse(knn_predictions)
+```
+
+```{r}
+# uses the overview function to display KNN model thresholds and confusion matrices
+overview_model(knn_cv, "KNN", c(0.05, 0.50, 0.52))
+```
+
+```{r}
+logreg_pen_predictions <- logreg_pen_result_cv %>% collect_predictions()
+glimpse(logreg_pen_predictions)
+```
+
+```{r}
+# uses the overview function to display KNN model thresholds and confusion matrices
+overview_model(logreg_pen_result_cv, "Penalized Logistic Regression", c(0.05, 0.25, 0.30))
+```
+
+```{r}
+svm_predictions <- svm_linear_result_cv %>% collect_predictions()
+glimpse(svm_predictions)
+```
+
+```{r}
+# uses the overview function to display KNN model thresholds and confusion matrices
+overview_model(svm_linear_result_cv, "Linear SVM", c(0.05, 0.20, 0.24))
+```
+
+```{r}
+rf_predictions <- rf_result_cv %>% collect_predictions()
+glimpse(rf_predictions)
+```
+
+```{r}
+# uses the overview function to display KNN model thresholds and confusion matrices
+overview_model(rf_result_cv, "Random Forrest", c(0.12, 0.40, 0.45))
+```
+
+```{r}
+# Collect predictions from the cross-validated SVM Polynomial model
+svm_poly_predictions <- svm_poly_result_cv %>% collect_predictions()
+glimpse(svm_poly_predictions)
+
+overview_model(svm_poly_result_cv, "SVM Polynomial", c(0.05, 0.30, 0.35))
+```
+
+```{r}
+# Collect predictions from the cross-validated SVM RBF model
+svm_rbf_predictions <- svm_rbf_result_cv %>% collect_predictions()
+glimpse(svm_rbf_predictions)
+
+# Use the overview function to display SVM RBF model thresholds and confusion matrices
+overview_model(svm_rbf_result_cv, "SVM RBF", c(0.05, 0.07, 0.35))
+```
+
+```{r}
+create_conf_matrix <- function(model, data, threshold = 0.5) {
+  # Predict probabilities
+  prob_predictions <- predict(model, new_data = data, type = "prob")
+  
+  # Apply threshold
+  prob_predictions <- prob_predictions %>%
+    mutate(predicted_class = if_else(.pred_Yes >= threshold, "Yes", "No"),
+           predicted_class = factor(predicted_class, levels = c("No", "Yes")))
+  
+  # Combine with actual outcomes
+  results <- data %>%
+    dplyr::select(Blue_Tarp) %>%
+    bind_cols(prob_predictions)
+  
+  # Ensure Blue_Tarp is a factor (if it's not already)
+  results <- mutate(results, Blue_Tarp = factor(Blue_Tarp, levels = c("No", "Yes")))
+
+  # Create confusion matrix
+  conf_matrix <- conf_mat(results, truth = Blue_Tarp, estimate = predicted_class)
+  
+  # Plot confusion matrix
+  plot <- autoplot(conf_matrix, type = "heatmap") +
+    labs(title = "Confusion Matrix",
+         subtitle = sprintf("Threshold: %.2f", threshold),
+         x = "Actual Class", y = "Predicted Class")
+  
+  return(plot)
+}
+```
+
+```{r}
+create_conf_matrix(logreg_fitted_model, data_holdout, threshold = 0.07)
+```
+
+```{r}
+create_conf_matrix(lda_fitted_model, data_holdout, threshold = 0.07)
+```
+
+```{r}
+create_conf_matrix(qda_fitted_model, data_holdout, threshold = 0.24)
+```
+
+```{r}
+create_conf_matrix(knn_fitted_model, data_holdout, threshold = 0.35)
+```
+
+```{r}
+create_conf_matrix(logreg_pen_fitted_model, data_holdout, threshold = 0.35)
+```
+
+```{r}
+create_conf_matrix(svm_linear_fitted_model, data_holdout, threshold = 0.35)
+```
+
+```{r}
+create_conf_matrix(rf_fitted_model, data_holdout, threshold = 0.35)
+```
+
+```{r}
+# this chunk collects the metrics for the cv_results and the metrics for the 
+# fitted data on the holdout set for logistic regression
+
+logreg_cv_results <- collect_metrics(logreg_result_cv) %>%
+    dplyr::select(.metric, mean) %>%
+    rename(.estimate=mean) %>%
+    mutate(result="Logreg Cross-validation")
+logreg_holdout_predictions <- augment(logreg_fitted_model, new_data=data_holdout)
+logreg_holdout_results <-  bind_rows(
+        c(roc_auc(logreg_holdout_predictions, Blue_Tarp, .pred_Yes, event_level="second")),
+        c(accuracy(logreg_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(sensitivity(logreg_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(specificity(logreg_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(precision(logreg_holdout_predictions, Blue_Tarp, .pred_class)),
+    ) %>%
+    dplyr::select(-.estimator) %>%
+    mutate(result="Logreg Holdout") 
+```
+
+```{r}
+# this chunk collects the metrics for the cv_results and the metrics for the 
+# fitted data on the holdout set for LDA
+
+lda_cv_results <- collect_metrics(lda_result_cv) %>%
+    dplyr::select(.metric, mean) %>%
+    rename(.estimate=mean) %>%
+    mutate(result="LDA Cross-validation")
+lda_holdout_predictions <- augment(lda_fitted_model, new_data=data_holdout)
+lda_holdout_results <-  bind_rows(
+        c(roc_auc(lda_holdout_predictions, Blue_Tarp, .pred_Yes, event_level="second")),
+        c(accuracy(lda_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(sensitivity(lda_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(specificity(lda_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(precision(lda_holdout_predictions, Blue_Tarp, .pred_class)),
+    ) %>%
+    dplyr::select(-.estimator) %>%
+    mutate(result="LDA Holdout") 
+```
+
+```{r}
+# this chunk collects the metrics for the cv_results and the metrics for the 
+# fitted data on the holdout set for QDA
+
+qda_cv_results <- collect_metrics(qda_result_cv) %>%
+    dplyr::select(.metric, mean) %>%
+    rename(.estimate=mean) %>%
+    mutate(result="QDA Cross-validation")
+qda_holdout_predictions <- augment(qda_fitted_model, new_data=data_holdout)
+qda_holdout_results <-  bind_rows(
+        c(roc_auc(qda_holdout_predictions, Blue_Tarp, .pred_Yes, event_level="second")),
+        c(accuracy(qda_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(sensitivity(qda_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(specificity(qda_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(precision(qda_holdout_predictions, Blue_Tarp, .pred_class)),
+    ) %>%
+    dplyr::select(-.estimator) %>%
+    mutate(result="QDA Holdout") 
+```
+
+
+```{r}
+# this chunk collects the metrics for the cv_results and the metrics for the 
+# fitted data on the holdout set for KNN
+
+knn_cv_results <- collect_metrics(knn_result_cv) %>%
+    dplyr::select(.metric, mean) %>%
+    rename(.estimate=mean) %>%
+    mutate(result="KNN Cross-validation")
+knn_holdout_predictions <- augment(knn_fitted_model, new_data=data_holdout)
+knn_holdout_results <-  bind_rows(
+        c(roc_auc(knn_holdout_predictions, Blue_Tarp, .pred_Yes, event_level="second")),
+        c(accuracy(knn_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(sensitivity(knn_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(specificity(knn_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(precision(knn_holdout_predictions, Blue_Tarp, .pred_class)),
+    ) %>%
+    dplyr::select(-.estimator) %>%
+    mutate(result="KNN Holdout") 
+```
+
+```{r}
+# this chunk collects the metrics for the cv_results and the metrics for the 
+# fitted data on the holdout set for penalized logistic regression
+
+logreg_pen_cv_results <- collect_metrics(logreg_pen_result_cv) %>%
+    dplyr::select(.metric, mean) %>%
+    rename(.estimate=mean) %>%
+    mutate(result="KNN Cross-validation")
+logreg_pen_holdout_predictions <- augment(logreg_pen_fitted_model, new_data=data_holdout)
+logreg_pen_results <-  bind_rows(
+        c(roc_auc(logreg_pen_holdout_predictions, Blue_Tarp, .pred_Yes, event_level="second")),
+        c(accuracy(logreg_pen_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(sensitivity(logreg_pen_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(specificity(logreg_pen_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(precision(logreg_pen_holdout_predictions, Blue_Tarp, .pred_class)),
+    ) %>%
+    dplyr::select(-.estimator) %>%
+    mutate(result="Penalized Logistic Regression Holdout") 
+```
+
+```{r}
+# this chunk collects the metrics for the cv_results and the metrics for the 
+# fitted data on the holdout set for linear SVM
+
+svm_cv_results <- collect_metrics(svm_linear_result_cv) %>%
+    dplyr::select(.metric, mean) %>%
+    rename(.estimate=mean) %>%
+    mutate(result="SVM Cross-validation")
+svm_holdout_predictions <- augment(svm_linear_fitted_model, new_data=data_holdout)
+svm_results <-  bind_rows(
+        c(roc_auc(svm_holdout_predictions, Blue_Tarp, .pred_Yes, event_level="second")),
+        c(accuracy(svm_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(sensitivity(svm_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(specificity(svm_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(precision(svm_holdout_predictions, Blue_Tarp, .pred_class)),
+    ) %>%
+    dplyr::select(-.estimator) %>%
+    mutate(result="SVM Holdout") 
+```
+
+```{r}
+# this chunk collects the metrics for the cv_results and the metrics for the 
+# fitted data on the holdout set for random forrest
+
+rf_cv_results <- collect_metrics(rf_result_cv) %>%
+    dplyr::select(.metric, mean) %>%
+    rename(.estimate=mean) %>%
+    mutate(result="Random Forrest Cross-validation")
+rf_holdout_predictions <- augment(rf_fitted_model, new_data=data_holdout)
+rf_results <-  bind_rows(
+        c(roc_auc(rf_holdout_predictions, Blue_Tarp, .pred_Yes, event_level="second")),
+        c(accuracy(rf_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(sensitivity(rf_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(specificity(rf_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(precision(rf_holdout_predictions, Blue_Tarp, .pred_class)),
+    ) %>%
+    dplyr::select(-.estimator) %>%
+    mutate(result="Random Forrest Holdout") 
+```
+
+```{r}
+# Collect metrics for SVM Polynomial from CV results
+svm_poly_cv_results <- collect_metrics(svm_poly_result_cv) %>%
+    dplyr::select(.metric, mean) %>%
+    rename(.estimate=mean) %>%
+    mutate(result="SVM Polynomial Cross-validation")
+
+# Predictions on holdout set and calculate metrics for SVM Polynomial
+svm_poly_holdout_predictions <- augment(svm_poly_fitted_model, new_data=data_holdout)
+svm_poly_results <-  bind_rows(
+        c(roc_auc(svm_poly_holdout_predictions, Blue_Tarp, .pred_Yes, event_level="second")),
+        c(accuracy(svm_poly_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(sensitivity(svm_poly_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(specificity(svm_poly_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(precision(svm_poly_holdout_predictions, Blue_Tarp, .pred_class))
+    ) %>%
+    dplyr::select(-.estimator) %>%
+    mutate(result="SVM Polynomial Holdout")
+```
+
+```{r}
+# Collect metrics for SVM RBF from CV results
+svm_rbf_cv_results <- collect_metrics(svm_rbf_result_cv) %>%
+    dplyr::select(.metric, mean) %>%
+    rename(.estimate=mean) %>%
+    mutate(result="SVM RBF Cross-validation")
+
+# Predictions on holdout set and calculate metrics for SVM RBF
+svm_rbf_holdout_predictions <- augment(svm_rbf_fitted_model, new_data=data_holdout)
+svm_rbf_results <-  bind_rows(
+        c(roc_auc(svm_rbf_holdout_predictions, Blue_Tarp, .pred_Yes, event_level="second")),
+        c(accuracy(svm_rbf_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(sensitivity(svm_rbf_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(specificity(svm_rbf_holdout_predictions, Blue_Tarp, .pred_class)),
+        c(precision(svm_rbf_holdout_predictions, Blue_Tarp, .pred_class))
+    ) %>%
+    dplyr::select(-.estimator) %>%
+    mutate(result="SVM RBF Holdout")
+```
+
+
+```{r}
+# this binds the above results into a single table
+bind_rows(
+    logreg_cv_results,
+    logreg_holdout_results,
+    lda_cv_results,
+    lda_holdout_results,
+    qda_cv_results,
+    qda_holdout_results,
+    knn_cv_results,
+    knn_holdout_results,
+    logreg_pen_cv_results,
+    logreg_pen_results,
+    svm_cv_results,  
+    svm_results,  
+    rf_cv_results,
+    rf_results,
+    svm_poly_cv_results,  
+    svm_poly_results,  
+    #svm_rbf_cv_results, 
+    #svm_rbf_holdout_results 
+) %>% 
+    pivot_wider(names_from=.metric, values_from=.estimate) %>%
+    kableExtra::kbl(caption="Model performance metrics", digits=3) %>%
+    kableExtra::kable_styling(full_width=FALSE)
+```
+        
+
+```{r}
+# Define thresholds for each model
+thresholds <- list(
+  logreg = 0.23,
+  lda = 0.85,
+  qda = 0.3,
+  knn = 0.5,
+  logreg_pen = 0.3,
+  svm_linear = 0.24,
+  rf = 0.45,
+  svm_poly = 0.35,
+  svm_rbf - .35
+)
+```
+
+```{r}
+# Function to adjust predictions based on the threshold
+adjust_predictions <- function(predictions, threshold) {
+  predictions %>%
+    mutate(.pred_class = make_two_class_pred(.pred_Yes, levels(predictions$Blue_Tarp), threshold = threshold))
+}
+```
+
+
+```{r}
+# Code below calculates our performance metrics and cv metrics for a defined threshold for every model
+
+# Logistic Regression
+logreg_cv_results <- collect_metrics(logreg_result_cv) %>%
+  dplyr::select(.metric, mean) %>%
+  rename(.estimate = mean) %>%
+  mutate(result = "Logreg Cross-validation", threshold = thresholds$logreg)
+
+logreg_holdout_predictions <- augment(logreg_fitted_model, new_data = data_holdout) %>%
+  adjust_predictions(thresholds$logreg)
+
+logreg_holdout_results <- bind_rows(
+  roc_auc(logreg_holdout_predictions, Blue_Tarp, .pred_Yes, event_level = "second"),
+  accuracy(logreg_holdout_predictions, Blue_Tarp, .pred_class),
+  sensitivity(logreg_holdout_predictions, Blue_Tarp, .pred_class),
+  specificity(logreg_holdout_predictions, Blue_Tarp, .pred_class),
+  precision(logreg_holdout_predictions, Blue_Tarp, .pred_class)
+) %>%
+  dplyr::select(-.estimator) %>%
+  mutate(result = "Logreg Holdout", threshold = thresholds$logreg)
+
+# LDA
+lda_cv_results <- collect_metrics(lda_result_cv) %>%
+  dplyr::select(.metric, mean) %>%
+  rename(.estimate = mean) %>%
+  mutate(result = "LDA Cross-validation", threshold = thresholds$lda)
+
+lda_holdout_predictions <- augment(lda_fitted_model, new_data = data_holdout) %>%
+  adjust_predictions(thresholds$lda)
+
+lda_holdout_results <- bind_rows(
+  roc_auc(lda_holdout_predictions, Blue_Tarp, .pred_Yes, event_level = "second"),
+  accuracy(lda_holdout_predictions, Blue_Tarp, .pred_class),
+  sensitivity(lda_holdout_predictions, Blue_Tarp, .pred_class),
+  specificity(lda_holdout_predictions, Blue_Tarp, .pred_class),
+  precision(lda_holdout_predictions, Blue_Tarp, .pred_class)
+) %>%
+  dplyr::select(-.estimator) %>%
+  mutate(result = "LDA Holdout", threshold = thresholds$lda)
+
+# QDA
+qda_cv_results <- collect_metrics(qda_result_cv) %>%
+  dplyr::select(.metric, mean) %>%
+  rename(.estimate = mean) %>%
+  mutate(result = "QDA Cross-validation", threshold = thresholds$qda)
+
+qda_holdout_predictions <- augment(qda_fitted_model, new_data = data_holdout) %>%
+  adjust_predictions(thresholds$qda)
+
+qda_holdout_results <- bind_rows(
+  roc_auc(qda_holdout_predictions, Blue_Tarp, .pred_Yes, event_level = "second"),
+  accuracy(qda_holdout_predictions, Blue_Tarp, .pred_class),
+  sensitivity(qda_holdout_predictions, Blue_Tarp, .pred_class),
+  specificity(qda_holdout_predictions, Blue_Tarp, .pred_class),
+  precision(qda_holdout_predictions, Blue_Tarp, .pred_class)
+) %>%
+  dplyr::select(-.estimator) %>%
+  mutate(result = "QDA Holdout", threshold = thresholds$qda)
+
+# KNN
+knn_cv_results <- collect_metrics(knn_result_cv) %>%
+  dplyr::select(.metric, mean) %>%
+  rename(.estimate = mean) %>%
+  mutate(result = "KNN Cross-validation", threshold = thresholds$knn)
+
+knn_holdout_predictions <- augment(knn_fitted_model, new_data = data_holdout) %>%
+  adjust_predictions(thresholds$knn)
+
+knn_holdout_results <- bind_rows(
+  roc_auc(knn_holdout_predictions, Blue_Tarp, .pred_Yes, event_level = "second"),
+  accuracy(knn_holdout_predictions, Blue_Tarp, .pred_class),
+  sensitivity(knn_holdout_predictions, Blue_Tarp, .pred_class),
+  specificity(knn_holdout_predictions, Blue_Tarp, .pred_class),
+  precision(knn_holdout_predictions, Blue_Tarp, .pred_class)
+) %>%
+  dplyr::select(-.estimator) %>%
+  mutate(result = "KNN Holdout", threshold = thresholds$knn)
+
+# Penalized Logistic Regression
+logreg_pen_cv_results <- collect_metrics(logreg_pen_result_cv) %>%
+  dplyr::select(.metric, mean) %>%
+  rename(.estimate = mean) %>%
+  mutate(result = "Logreg Pen Cross-validation", threshold = thresholds$logreg_pen)
+
+logreg_pen_holdout_predictions <- augment(logreg_pen_fitted_model, new_data = data_holdout) %>%
+  adjust_predictions(thresholds$logreg_pen)
+
+logreg_pen_holdout_results <- bind_rows(
+  roc_auc(logreg_pen_holdout_predictions, Blue_Tarp, .pred_Yes, event_level = "second"),
+  accuracy(logreg_pen_holdout_predictions, Blue_Tarp, .pred_class),
+  sensitivity(logreg_pen_holdout_predictions, Blue_Tarp, .pred_class),
+  specificity(logreg_pen_holdout_predictions, Blue_Tarp, .pred_class),
+  precision(logreg_pen_holdout_predictions, Blue_Tarp, .pred_class)
+) %>%
+  dplyr::select(-.estimator) %>%
+  mutate(result = "Logreg Pen Holdout", threshold = thresholds$logreg_pen)
+
+# Linear SVM
+svm_cv_results <- collect_metrics(svm_linear_result_cv) %>%
+  dplyr::select(.metric, mean) %>%
+  rename(.estimate = mean) %>%
+  mutate(result = "SVM Linear Cross-validation", threshold = thresholds$svm_linear)
+
+svm_holdout_predictions <- augment(svm_linear_fitted_model, new_data = data_holdout) %>%
+  adjust_predictions(thresholds$svm_linear)
+
+svm_holdout_results <- bind_rows(
+  roc_auc(svm_holdout_predictions, Blue_Tarp, .pred_Yes, event_level = "second"),
+  accuracy(svm_holdout_predictions, Blue_Tarp, .pred_class),
+  sensitivity(svm_holdout_predictions, Blue_Tarp, .pred_class),
+  specificity(svm_holdout_predictions, Blue_Tarp, .pred_class),
+  precision(svm_holdout_predictions, Blue_Tarp, .pred_class)
+) %>%
+  dplyr::select(-.estimator) %>%
+  mutate(result = "SVM Linear Holdout", threshold = thresholds$svm_linear)
+
+# Random Forest
+rf_cv_results <- collect_metrics(rf_result_cv) %>%
+  dplyr::select(.metric, mean) %>%
+  rename(.estimate = mean) %>%
+  mutate(result = "Random Forest Cross-validation", threshold = thresholds$rf)
+
+rf_holdout_predictions <- augment(rf_fitted_model, new_data = data_holdout) %>%
+  adjust_predictions(thresholds$rf)
+
+rf_holdout_results <- bind_rows(
+  roc_auc(rf_holdout_predictions, Blue_Tarp, .pred_Yes, event_level = "second"),
+  accuracy(rf_holdout_predictions, Blue_Tarp, .pred_class),
+  sensitivity(rf_holdout_predictions, Blue_Tarp, .pred_class),
+  specificity(rf_holdout_predictions, Blue_Tarp, .pred_class),
+  precision(rf_holdout_predictions, Blue_Tarp, .pred_class)
+) %>%
+  dplyr::select(-.estimator) %>%
+  mutate(result = "Random Forest Holdout", threshold = thresholds$rf)
+
+# Polynomial SVM
+svm_poly_cv_results <- collect_metrics(svm_poly_result_cv) %>%
+  dplyr::select(.metric, mean) %>%
+  rename(.estimate = mean) %>%
+  mutate(result = "SVM Polynomial Cross-validation", threshold = thresholds$svm_poly)
+
+svm_poly_holdout_predictions <- augment(svm_poly_fitted_model, new_data = data_holdout) %>%
+  adjust_predictions(thresholds$svm_poly)
+
+svm_poly_holdout_results <- bind_rows(
+  roc_auc(svm_poly_holdout_predictions, Blue_Tarp, .pred_Yes, event_level = "second"),
+  accuracy(svm_poly_holdout_predictions, Blue_Tarp, .pred_class),
+  sensitivity(svm_poly_holdout_predictions, Blue_Tarp, .pred_class),
+  specificity(svm_poly_holdout_predictions, Blue_Tarp, .pred_class),
+  precision(svm_poly_holdout_predictions, Blue_Tarp, .pred_class)
+) %>%
+  dplyr::select(-.estimator) %>%
+  mutate(result = "SVM Polynomial Holdout", threshold = thresholds$svm_poly)
+
+# SVM RBF
+svm_rbf_cv_results <- collect_metrics(svm_rbf_result_cv) %>%
+  dplyr::select(.metric, mean) %>%
+  rename(.estimate = mean) %>%
+  mutate(result = "SVM RBF Cross-validation", threshold = thresholds$svm_rbf)
+
+svm_rbf_holdout_predictions <- augment(svm_rbf_fitted_model, new_data = data_holdout) %>%
+  adjust_predictions(thresholds$svm_rbf)
+
+svm_rbf_holdout_results <- bind_rows(
+  roc_auc(svm_rbf_holdout_predictions, Blue_Tarp, .pred_Yes, event_level = "second"),
+  accuracy(svm_rbf_holdout_predictions, Blue_Tarp, .pred_class),
+  sensitivity(svm_rbf_holdout_predictions, Blue_Tarp, .pred_class),
+  specificity(svm_rbf_holdout_predictions, Blue_Tarp, .pred_class),
+  precision(svm_rbf_holdout_predictions, Blue_Tarp, .pred_class)
+) %>%
+  dplyr::select(-.estimator) %>%
+  mutate(result = "SVM RBF Holdout", threshold = thresholds$svm_rbf)
+
+# Combine all results
+combined_results <- bind_rows(
+  logreg_cv_results, logreg_holdout_results,
+  lda_cv_results, lda_holdout_results,
+  qda_cv_results, qda_holdout_results,
+  knn_cv_results, knn_holdout_results,
+  logreg_pen_cv_results, logreg_pen_holdout_results,
+  svm_cv_results, svm_holdout_results,
+  rf_cv_results, rf_holdout_results,
+  svm_poly_cv_results, svm_poly_holdout_results,
+  svm_rbf_cv_results, svm_rbf_holdout_results
+)
+
+# Display the results
+print(combined_results)knn
+```
+
+
+```{r}
+# Set a threshold
+threshold <- 0.5
+
+# Collect and format cross-validation metrics for Logistic Regression
+logreg_cv_results <- collect_metrics(logreg_result_cv) %>%
+    dplyr::select(.metric, mean) %>%
+    rename(.estimate = mean) %>%
+    mutate(result = "Logreg Cross-validation")
+
+# Generate predictions on holdout data using the fitted Logistic Regression model
+logreg_holdout_predictions <- augment(logreg_fitted_model, new_data = data_holdout)
+
+# Adjust predictions based on the threshold
+logreg_holdout_predictions <- logreg_holdout_predictions %>%
+    mutate(.pred_class = make_two_class_pred(.pred_Yes, levels(Blue_Tarp), threshold = threshold))
+
+# Collect and format holdout metrics for Logistic Regression
+logreg_holdout_results <- bind_rows(
+    c(roc_auc(logreg_holdout_predictions, Blue_Tarp, .pred_Yes, event_level = "second")),
+    c(accuracy(logreg_holdout_predictions, Blue_Tarp, .pred_class)),
+    c(sensitivity(logreg_holdout_predictions, Blue_Tarp, .pred_class)),
+    c(specificity(logreg_holdout_predictions, Blue_Tarp, .pred_class)),
+    c(precision(logreg_holdout_predictions, Blue_Tarp, .pred_class))
+) %>%
+    dplyr::select(-.estimator) %>%
+    mutate(result = "Logreg Holdout")
+
+# Combine results for cross-validation and holdout
+combined_results <- bind_rows(logreg_cv_results, logreg_holdout_results)
+
+# Display the results
+print(combined_results)
+```
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
+
+```{r}
+stopCluster(cl)
+registerDoSEQ()
+```
+
